@@ -2,6 +2,11 @@ import os
 import sys
 import time
 import threading
+import logging
+import asyncio
+import queue
+import shutil
+import subprocess
 from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException
@@ -29,6 +34,21 @@ class StartConfig(BaseModel):
     attack_net: Optional[str] = None    # optional for accuracy calc on custom traffic
     victim_net: Optional[str] = None    # optional for accuracy calc on custom traffic
     threshold: float = 0.5              # threshold on fraction of predicted ddos windows to trigger alert
+    source_kind: Optional[str] = None   # iface | pcap | http (external push)
+    # Optional: force ground-truth labeling to help compute KPIs when labels are unavailable
+    # one of: 'all_attack', 'all_benign'
+    ground_truth_override: Optional[str] = None
+
+
+class IngestPayload(BaseModel):
+    # Each fragment is a 2D list (packets x features) as expected by normalize_and_padding
+    fragments: List[List[List[float]]]
+    # Optional metadata aligned to fragments for UI/mitigation metrics
+    src_ips: Optional[List[Optional[str]]] = None
+    dest_ports: Optional[List[Optional[int]]] = None
+    ts: Optional[float] = None
+    # Optional ground-truth labels per fragment (0/1), used to compute TPR/FPR/TTD in HTTP mode
+    labels: Optional[List[Optional[int]]] = None
 
 
 class ConnectionManager:
@@ -79,17 +99,94 @@ class DetectorService:
         # predictive analytics (simple EWMA of ddos_fraction)
         self._ewma_ddos = None
         self._ewma_alpha = 0.5
+        # reference to the asyncio event loop for cross-thread broadcasts
+        self._async_loop: Optional[asyncio.AbstractEventLoop] = None
+        # external ingest buffer and source kind
+        self._ingest: Optional["queue.Queue"] = None
+        self._source_kind: str = "pcap"
+        # auto-mitigation settings
+        self._auto_block_limit = 20  # cap number of sources auto-blocked per window
+        self.hysteresis_windows = 2  # require N consecutive alert windows before acting
+        self.cooldown_seconds = 120  # do not re-act on same source within this window (seconds)
+        self.allowlist = set()       # sources that should never be blocked
+        self._consecutive_alerts = 0
+        # mitigation state per source: {ip: {stage, last_action, cooldown_until, pos_count}}
+        self._mitigation: Dict[str, Dict[str, Any]] = {}
+
+        # accuracy-at-scale metrics (optional if labels available)
+        self._tp = 0
+        self._fp = 0
+        self._tn = 0
+        self._fn = 0
+        self._attack_active = False
+        self._attack_start_ts: Optional[float] = None
+        self._first_alert_ts: Optional[float] = None
+        self._ttds: List[float] = []
+
+        # downtime prevention accounting
+        self._prevented_downtime_min = 0.0
+        # KPI configuration
+        self._gt_override = None
+
+    # Diagnostics helpers
+    @staticmethod
+    def _tshark_path() -> Optional[str]:
+        return shutil.which("tshark")
+
+    @staticmethod
+    def list_interfaces() -> List[Dict[str, str]]:
+        """Return list of capture interfaces using `tshark -D` if available."""
+        path = DetectorService._tshark_path()
+        if not path:
+            return []
+        try:
+            proc = subprocess.run([path, "-D"], capture_output=True, text=True, timeout=5)
+            out = proc.stdout or ""
+        except Exception:
+            return []
+        result: List[Dict[str, str]] = []
+        for line in out.splitlines():
+            # Format: "1. eth0 (Linux cooked capture)"
+            line = line.strip()
+            if not line or "." not in line:
+                continue
+            try:
+                idx_part, rest = line.split(".", 1)
+                name_desc = rest.strip()
+                # name is token until space or (desc)
+                name = name_desc.split(" ")[0]
+                desc = name_desc[len(name):].strip()
+                result.append({"name": name, "desc": desc})
+            except Exception:
+                continue
+        return result
+
+    def set_loop(self, loop: asyncio.AbstractEventLoop):
+        self._async_loop = loop
 
     def status(self) -> Dict[str, Any]:
+        # compute live accuracy metrics if any labels observed
+        tpr = (self._tp / (self._tp + self._fn)) if (self._tp + self._fn) > 0 else None
+        fpr = (self._fp / (self._fp + self._tn)) if (self._fp + self._tn) > 0 else None
+        ttd = (sum(self._ttds) / len(self._ttds)) if self._ttds else None
         return {
             "status": self._status,
             "last_error": self._last_error,
             "model": self.model_info,
             "blocked_sources": list(self.blocked_sources),
+            "mitigation": [{"ip": ip, "stage": state.get("stage", "rate-limit")} for ip, state in self._mitigation.items()],
+            "accuracy": {"TPR": tpr, "FPR": fpr, "TTD_sec": ttd},
+            "prevented_downtime_min": self._prevented_downtime_min,
         }
 
     def stop(self):
         self._stop_event.set()
+        # Nudge external ingest loop to exit promptly
+        try:
+            if self._ingest is not None:
+                self._ingest.put_nowait({"_stop": True})
+        except Exception:
+            pass
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
         self._thread = None
@@ -158,6 +255,12 @@ class DetectorService:
         if self._status == "running":
             raise RuntimeError("Detector already running")
 
+        # Determine source kind
+        if cfg.source_kind in ("iface", "pcap", "http"):
+            self._source_kind = cfg.source_kind
+        else:
+            self._source_kind = "pcap" if str(cfg.source).endswith('.pcap') else "iface"
+
         # Load model and infer time window and flow len from filename convention: '<t>t-<n>n-*.h5'
         resolved_model_path = self._resolve_model_path(cfg.model_path)
         model_filename = os.path.basename(resolved_model_path)
@@ -170,6 +273,7 @@ class DetectorService:
             self.time_window = 10
             self.max_flow_len = 10
 
+        logger.info(f"Loading model: {resolved_model_path}")
         self.model = load_model(resolved_model_path)
         self.model_info = {
             "path": resolved_model_path,
@@ -180,18 +284,47 @@ class DetectorService:
         # labels (optional - for accuracy calc if dataset info provided)
         self.labels = parse_labels(cfg.dataset_type, cfg.attack_net, cfg.victim_net)
 
-        # capture setup
-        resolved_source = self._resolve_source_path(cfg.source)
-        if resolved_source.endswith('.pcap'):
-            self.cap_file = pyshark.FileCapture(resolved_source)
+        # capture setup or external ingest
+        if self._source_kind == "http":
             self.cap = None
-            data_source = os.path.basename(resolved_source)
-        else:
-            self.cap = pyshark.LiveCapture(interface=resolved_source)
             self.cap_file = None
-            data_source = resolved_source
+            # queue for external fragments
+            self._ingest = queue.Queue()
+            data_source = "http-ingest"
+            logger.info(f"Starting external ingest mode (HTTP) (tw={self.time_window}s, n={self.max_flow_len})")
+        else:
+            resolved_source = self._resolve_source_path(cfg.source)
+            logger.info(f"Starting capture: source={resolved_source} (tw={self.time_window}s, n={self.max_flow_len})")
+            if resolved_source.endswith('.pcap'):
+                try:
+                    self.cap_file = pyshark.FileCapture(resolved_source)
+                except Exception as e:
+                    raise ValueError(f"Failed to open PCAP with pyshark: {resolved_source} :: {e}")
+                self.cap = None
+                data_source = os.path.basename(resolved_source)
+            else:
+                # Preflight checks for live capture
+                if not self._tshark_path():
+                    raise ValueError("tshark not found. Install it (e.g., sudo apt install tshark) and ensure dumpcap has capture permissions (e.g., sudo dpkg-reconfigure wireshark-common; sudo usermod -aG wireshark $USER; or sudo setcap cap_net_raw,cap_net_admin=eip $(which dumpcap))")
+                # Optional: hint if interface is unknown
+                try:
+                    names = {i.get('name') for i in self.list_interfaces()}
+                    if names and resolved_source not in names:
+                        logger.warning(f"Interface '{resolved_source}' not listed by tshark -D. Available: {sorted(names)}")
+                except Exception:
+                    pass
+                try:
+                    self.cap = pyshark.LiveCapture(interface=resolved_source)
+                except Exception as e:
+                    raise ValueError(
+                        "Failed to open live capture on interface '%s': %s. "
+                        "Verify interface exists (tshark -D), and that tshark/dumpcap can capture without root (see wireshark group or setcap)." % (resolved_source, e)
+                    )
+                self.cap_file = None
+                data_source = resolved_source
 
         self.threshold = cfg.threshold
+        self._gt_override = cfg.ground_truth_override
         self._stop_event.clear()
         self._status = "running"
         self._last_error = None
@@ -204,40 +337,167 @@ class DetectorService:
         mins, maxs = static_min_max(self.time_window)
         while not self._stop_event.is_set():
             try:
-                cap = self.cap if self.cap is not None else self.cap_file
-                samples = process_live_traffic(cap, None, self.labels, self.max_flow_len, traffic_type="all", time_window=self.time_window)
-                if len(samples) == 0:
-                    # For file capture, when finished, stop
-                    if isinstance(cap, pyshark.FileCapture):
-                        self._status = "completed"
+                # Ingest traffic for this window
+                if self._source_kind == "http":
+                    # Drain ingest queue for the duration of time_window, with responsive stop
+                    end = time.time() + self.time_window
+                    fragments: List[Any] = []
+                    src_ips: List[Optional[str]] = []
+                    dest_ports: List[Optional[int]] = []
+                    labels_list: List[Optional[int]] = []
+                    if self._ingest is None:
+                        # Sleep in small increments so stop is responsive
+                        remaining = float(self.time_window)
+                        while remaining > 0 and not self._stop_event.is_set():
+                            step = 0.25 if remaining > 0.25 else remaining
+                            time.sleep(step)
+                            remaining -= step
+                    else:
+                        while time.time() < end and not self._stop_event.is_set():
+                            try:
+                                item = self._ingest.get(timeout=0.25)
+                                if isinstance(item, dict) and item.get("_stop"):
+                                    break
+                                frags = item.get("fragments", []) or []
+                                sips = item.get("src_ips") or [None] * len(frags)
+                                dps = item.get("dest_ports") or [None] * len(frags)
+                                lbs = item.get("labels") or [None] * len(frags)
+                                fragments.extend(frags)
+                                src_ips.extend(sips)
+                                dest_ports.extend(dps)
+                                labels_list.extend(lbs)
+                            except queue.Empty:
+                                pass
+                    if self._stop_event.is_set():
                         break
-                    # For live capture, just continue to next window
-                    continue
+                    if not fragments:
+                        # nothing arrived this window; send heartbeat and continue
+                        hb = {"ts": time.time(), "source": data_source, "samples": 0, "ddos_fraction": 0.0, "alert": False, "threshold": self.threshold}
+                        if self._async_loop is not None:
+                            try:
+                                asyncio.run_coroutine_threadsafe(self.manager.broadcast(hb), self._async_loop)
+                            except Exception:
+                                pass
+                        continue
+                    # Build metrics for external fragments
+                    uniq_dst_ports = {p for p in dest_ports if isinstance(p, int)}
+                    uniq_src_ips = {ip for ip in src_ips if isinstance(ip, str) and ip}
+                    packet_volume = int(sum(len(f) for f in fragments))
+                    metrics = {
+                        "flow_density": len(fragments),
+                        "unique_dest_ports": len(uniq_dst_ports),
+                        "src_ip_diversity": len(uniq_src_ips),
+                        "packet_volume": packet_volume,
+                    }
+                    # Prepare model input X and keys
+                    X_list = normalize_and_padding(fragments, mins, maxs, self.max_flow_len)
+                    if len(X_list) == 0:
+                        continue
+                    X = np.array(X_list)
+                    if X.size == 0 or X.ndim < 3:
+                        continue
+                    X = np.expand_dims(X, axis=3)
+                    keys = [(src_ips[i] or "external", None, None, dest_ports[i] or 0, None) for i in range(len(fragments))]
+                    Y_true = labels_list
+                    external_packets = packet_volume
+                else:
+                    cap = self.cap if self.cap is not None else self.cap_file
+                    samples = process_live_traffic(cap, None, self.labels, self.max_flow_len, traffic_type="all", time_window=self.time_window)
+                    if len(samples) == 0:
+                        # For file capture, when finished, stop
+                        if isinstance(cap, pyshark.FileCapture):
+                            self._status = "completed"
+                            break
+                        # For live capture, just continue to next window
+                        continue
 
-                # Apply mitigation simulation by filtering flows from blocked sources
-                if self.blocked_sources:
-                    filtered = []
-                    for (five_tuple, flow_dict) in samples:
-                        src_ip = five_tuple[0]
-                        if src_ip not in self.blocked_sources:
-                            filtered.append((five_tuple, flow_dict))
-                    samples = filtered
+                    # Apply mitigation simulation by filtering flows from blocked sources
+                    if self.blocked_sources:
+                        filtered = []
+                        for (five_tuple, flow_dict) in samples:
+                            src_ip = five_tuple[0]
+                            if src_ip not in self.blocked_sources:
+                                filtered.append((five_tuple, flow_dict))
+                        samples = filtered
 
-                # Compute metrics for current window
-                metrics = self._compute_metrics(samples)
+                    # Compute metrics for current window
+                    metrics = self._compute_metrics(samples)
 
-                # Build input for model
-                X, Y_true, keys = dataset_to_list_of_fragments(samples)
-                X = np.array(normalize_and_padding(X, mins, maxs, self.max_flow_len))
-                X = np.expand_dims(X, axis=3)
+                    # Build input for model
+                    X, Y_true, keys = dataset_to_list_of_fragments(samples)
+                    if len(X) == 0:
+                        # No fragments extracted this window; skip emitting
+                        continue
+                    X = np.array(normalize_and_padding(X, mins, maxs, self.max_flow_len))
+                    if X.size == 0 or X.ndim < 3:
+                        # Defensive: nothing to score
+                        continue
+                    X = np.expand_dims(X, axis=3)
 
                 t0 = time.time()
                 y_pred = np.squeeze(self.model.predict(X, batch_size=2048) > 0.5, axis=1)
                 latency = time.time() - t0
-                [packets] = count_packets_in_dataset([X])
+                if self._source_kind == "http":
+                    packets = external_packets
+                else:
+                    [packets] = count_packets_in_dataset([X])
 
                 ddos_fraction = float(np.sum(y_pred) / y_pred.shape[0]) if y_pred.shape[0] > 0 else 0.0
                 alert = ddos_fraction >= self.threshold
+
+                # Ground-truth window label if available (any flow labeled ddos), or overridden
+                ddos_true = None
+                if self._gt_override in ("all_attack", "all_benign"):
+                    ddos_true = (self._gt_override == "all_attack")
+                elif len(Y_true) > 0 and any(v is not None for v in Y_true):
+                    try:
+                        arr = np.array([int(bool(v)) for v in Y_true if v is not None])
+                        ddos_true = (np.sum(arr) > 0)
+                    except Exception:
+                        ddos_true = None
+
+                # Update hysteresis counter
+                if alert:
+                    self._consecutive_alerts += 1
+                else:
+                    self._consecutive_alerts = 0
+
+                auto_blocked_now: List[Dict[str, Any]] = []
+                # Only act if hysteresis satisfied
+                if alert and self._consecutive_alerts >= self.hysteresis_windows:
+                    # Identify likely offending sources from predicted-positive fragments
+                    counts: Dict[str, int] = {}
+                    for idx, pred in enumerate(y_pred):
+                        if pred:
+                            src_ip = keys[idx][0]
+                            if src_ip in self.allowlist:
+                                continue
+                            counts[src_ip] = counts.get(src_ip, 0) + 1
+                    if counts:
+                        # sort by descending count and act up to limit
+                        top_sources = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+                        to_consider = [src for src, _ in top_sources[: self._auto_block_limit]]
+                        now = time.time()
+                        for src in to_consider:
+                            state = self._mitigation.get(src, {"stage": "monitor", "pos_count": 0, "last_action": 0.0, "cooldown_until": 0.0})
+                            if now < state.get("cooldown_until", 0.0):
+                                continue
+                            state["pos_count"] = state.get("pos_count", 0) + counts[src]
+                            # escalate stages based on positive evidence
+                            if state["stage"] == "monitor":
+                                state["stage"] = "rate-limit"
+                            elif state["stage"] == "rate-limit" and state["pos_count"] >= 3:
+                                state["stage"] = "blackhole"
+                            state["last_action"] = now
+                            state["cooldown_until"] = now + self.cooldown_seconds
+                            self._mitigation[src] = state
+                            # in this simulation, both stages are treated as blocked for training/demo
+                            self.blocked_sources.add(src)
+                            auto_blocked_now.append({"ip": src, "stage": state["stage"], "reason": counts[src]})
+
+                # Downtime prevention estimation: if any mitigation is active during an alert window
+                if alert and auto_blocked_now:
+                    self._prevented_downtime_min += float(self.time_window) / 60.0
 
                 # Predictive analytics via EWMA trend estimation
                 if self._ewma_ddos is None:
@@ -246,6 +506,56 @@ class DetectorService:
                     self._ewma_ddos = self._ewma_alpha * ddos_fraction + (1 - self._ewma_alpha) * self._ewma_ddos
                 predicted_next = self._ewma_ddos  # naive next-step forecast
                 predicted_alert = predicted_next >= self.threshold
+
+                # Confidence for ddos_fraction using Wilson interval
+                def wilson(p, n, z=1.96):
+                    if n == 0:
+                        return (0.0, 0.0)
+                    denom = 1 + z*z/n
+                    center = p + z*z/(2*n)
+                    margin = z * ((p*(1-p)/n + z*z/(4*n*n))**0.5)
+                    low = max(0.0, (center - margin)/denom)
+                    high = min(1.0, (center + margin)/denom)
+                    return (low, high)
+                conf_low, conf_high = wilson(ddos_fraction, int(y_pred.shape[0]))
+
+                # Explainability: feature z-scores vs rolling baseline
+                baseline_count = min(30, len(self._history))
+                feature_scores = {}
+                if baseline_count > 5:
+                    recent = self._history[-baseline_count:]
+                    for k in ("flow_density", "unique_dest_ports", "src_ip_diversity", "packet_volume"):
+                        vals = [h.get("metrics", {}).get(k, 0) for h in recent]
+                        mean = float(np.mean(vals)) if vals else 0.0
+                        std = float(np.std(vals)) if vals else 1.0
+                        val = float(metrics.get(k, 0))
+                        z = (val - mean) / (std if std > 0 else 1.0)
+                        feature_scores[k] = z
+                top_features = sorted(feature_scores.items(), key=lambda kv: abs(kv[1]), reverse=True)[:3]
+
+                # Update accuracy statistics if ground truth available
+                if ddos_true is not None:
+                    if alert and ddos_true:
+                        self._tp += 1
+                    elif alert and not ddos_true:
+                        self._fp += 1
+                    elif (not alert) and ddos_true:
+                        self._fn += 1
+                    else:
+                        self._tn += 1
+                    # TTD
+                    if ddos_true and not self._attack_active:
+                        self._attack_active = True
+                        self._attack_start_ts = time.time()
+                        self._first_alert_ts = None
+                    if self._attack_active and alert and self._first_alert_ts is None and self._attack_start_ts is not None:
+                        self._first_alert_ts = time.time()
+                        self._ttds.append(self._first_alert_ts - self._attack_start_ts)
+                    if (not ddos_true) and self._attack_active:
+                        # reset when attack window ends
+                        self._attack_active = False
+                        self._attack_start_ts = None
+                        self._first_alert_ts = None
 
                 payload = {
                     "ts": time.time(),
@@ -257,21 +567,48 @@ class DetectorService:
                     "metrics": metrics,
                     "alert": alert,
                     "threshold": self.threshold,
+                    "blocked_sources": list(self.blocked_sources),
+                    "mitigation": [{"ip": ip, "stage": st.get("stage", "rate-limit")} for ip, st in self._mitigation.items()],
+                    "auto_blocked": auto_blocked_now,
+                    "accuracy": {
+                        "TPR": (self._tp / (self._tp + self._fn)) if (self._tp + self._fn) > 0 else None,
+                        "FPR": (self._fp / (self._fp + self._tn)) if (self._fp + self._tn) > 0 else None,
+                        "TTD_sec": (sum(self._ttds)/len(self._ttds)) if self._ttds else None,
+                    },
+                    "prevented_downtime_min": self._prevented_downtime_min,
                     "forecast": {
                         "ddos_fraction_next": predicted_next,
                         "predicted_alert": predicted_alert,
+                        "confidence_low": conf_low,
+                        "confidence_high": conf_high,
                     }
                 }
+                if top_features:
+                    payload["explain"] = {"top_features": top_features}
+                try:
+                    logger.info(f"window ts={payload['ts']:.0f} src={data_source} samples={payload['samples']} pkts={payload['packets']} ddos_frac={ddos_fraction:.3f} alert={alert}")
+                except Exception:
+                    pass
                 self._history.append(payload)
                 # Limit history size
                 if len(self._history) > 500:
                     self._history = self._history[-500:]
 
-                # Broadcast to clients
-                import anyio
-                anyio.from_thread.run(self.manager.broadcast, payload)
+                # Broadcast to clients from a worker thread using the server's asyncio loop
+                if self._async_loop is not None:
+                    try:
+                        asyncio.run_coroutine_threadsafe(self.manager.broadcast(payload), self._async_loop)
+                    except Exception:
+                        logger.exception("Failed to schedule broadcast to websocket clients")
+                else:
+                    # Loop not set yet; skip broadcast
+                    logger.warning("Async loop not set; skipping broadcast for this window")
 
             except Exception as e:
+                try:
+                    logger.exception("Error in detector loop")
+                except Exception:
+                    pass
                 self._last_error = str(e)
                 self._status = "error"
                 break
@@ -315,6 +652,8 @@ class DetectorService:
 
 
 app = FastAPI(title="LUCID DDoS Detection Web Service", version="0.1.0")
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(message)s')
+logger = logging.getLogger("lucid-app")
 manager = ConnectionManager()
 service = DetectorService(manager)
 
@@ -325,6 +664,13 @@ TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), "templates")
 os.makedirs(STATIC_DIR, exist_ok=True)
 os.makedirs(TEMPLATES_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.on_event("startup")
+async def on_startup():
+    # Capture the running asyncio loop so background threads can dispatch coroutines
+    loop = asyncio.get_running_loop()
+    service.set_loop(loop)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -345,6 +691,18 @@ def get_history():
     return service.history()
 
 
+@app.get("/api/interfaces")
+def get_interfaces():
+    """List available capture interfaces (best-effort)."""
+    try:
+        lst = service.list_interfaces()
+        ok = True
+    except Exception as e:
+        lst = []
+        ok = False
+    return {"ok": ok, "interfaces": lst, "tshark": bool(service._tshark_path())}
+
+
 @app.post("/api/start")
 def start(cfg: StartConfig):
     try:
@@ -353,11 +711,15 @@ def start(cfg: StartConfig):
     except FileNotFoundError as e:
         # Bad request from client (wrong path)
         raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        # Problems opening PCAP/interface
+        raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         # Conflicting state
         raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         # Unexpected server error
+        logger.exception("Unhandled error in /api/start")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -370,6 +732,10 @@ def stop():
 class MitigationRequest(BaseModel):
     block_sources: Optional[List[str]] = None
     unblock_sources: Optional[List[str]] = None
+    allowlist_add: Optional[List[str]] = None
+    allowlist_remove: Optional[List[str]] = None
+    hysteresis_windows: Optional[int] = None
+    cooldown_seconds: Optional[int] = None
 
 
 @app.post("/api/mitigation")
@@ -378,7 +744,68 @@ def mitigation(req: MitigationRequest):
         service.block_sources(req.block_sources)
     if req.unblock_sources:
         service.unblock_sources(req.unblock_sources)
-    return {"ok": True, "blocked_sources": list(service.blocked_sources)}
+    if req.allowlist_add:
+        for ip in req.allowlist_add:
+            service.allowlist.add(ip)
+            # ensure allowlisted IPs are not blocked
+            if ip in service.blocked_sources:
+                service.blocked_sources.remove(ip)
+            if ip in service._mitigation:
+                del service._mitigation[ip]
+    if req.allowlist_remove:
+        for ip in req.allowlist_remove:
+            if ip in service.allowlist:
+                service.allowlist.remove(ip)
+    if req.hysteresis_windows is not None:
+        try:
+            v = int(req.hysteresis_windows)
+            if v >= 0:
+                service.hysteresis_windows = v
+        except Exception:
+            pass
+    if req.cooldown_seconds is not None:
+        try:
+            v = int(req.cooldown_seconds)
+            if v >= 0:
+                service.cooldown_seconds = v
+        except Exception:
+            pass
+    return {
+        "ok": True,
+        "blocked_sources": list(service.blocked_sources),
+        "allowlist": list(service.allowlist),
+        "mitigation": [{"ip": ip, "stage": st.get("stage", "rate-limit")} for ip, st in service._mitigation.items()],
+        "hysteresis_windows": service.hysteresis_windows,
+        "cooldown_seconds": service.cooldown_seconds,
+    }
+
+
+@app.post("/api/ingest")
+def ingest(data: IngestPayload):
+    # Ensure service running and in external ingest mode
+    if service._status != "running":
+        raise HTTPException(status_code=409, detail="Detector not running")
+    if service._source_kind != "http":
+        raise HTTPException(status_code=409, detail="Ingest available only when started with source_kind='http'")
+    if service._ingest is None:
+        raise HTTPException(status_code=500, detail="Ingest buffer not initialized")
+    # Validate metadata alignment
+    n = len(data.fragments)
+    if data.src_ips is not None and len(data.src_ips) != n:
+        raise HTTPException(status_code=400, detail="src_ips length must match fragments length")
+    if data.dest_ports is not None and len(data.dest_ports) != n:
+        raise HTTPException(status_code=400, detail="dest_ports length must match fragments length")
+    if data.labels is not None and len(data.labels) != n:
+        raise HTTPException(status_code=400, detail="labels length must match fragments length")
+    # Push into buffer; loop drains per time_window
+    service._ingest.put({
+        "fragments": data.fragments,
+        "src_ips": data.src_ips,
+        "dest_ports": data.dest_ports,
+        "ts": data.ts or time.time(),
+        "labels": data.labels,
+    })
+    return {"ok": True, "queued": n}
 
 
 @app.websocket("/ws")
