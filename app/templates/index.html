@@ -93,6 +93,10 @@
         <label>Alert threshold (0-1):</label>
         <input type="number" step="0.01" id="threshold" value="0.5" />
       </div>
+      <div class="form-row">
+        <label>Demo token (optional):</label>
+        <input id="demoToken" placeholder="Paste token for protected demo" />
+      </div>
       <div class="buttons">
         <button id="startBtn">Start</button>
         <button id="stopBtn">Stop</button>
@@ -214,11 +218,18 @@
   const ingestTest = document.getElementById('ingestTest');
   const ingestJson = document.getElementById('ingestJson');
   const ingestResult = document.getElementById('ingestResult');
+  const demoTokenEl = document.getElementById('demoToken');
+  // Auth helpers
+  const tokenKey = 'lucid-demo-token';
+  try { const savedTok = localStorage.getItem(tokenKey); if (savedTok && demoTokenEl) demoTokenEl.value = savedTok; } catch {}
+  function getAuthToken() { return (demoTokenEl && demoTokenEl.value.trim()) || ''; }
+  function authHeaders() { const t = getAuthToken(); return t ? { 'Authorization': 'Bearer ' + t } : {}; }
+  if (demoTokenEl) { demoTokenEl.addEventListener('change', () => { try { localStorage.setItem(tokenKey, demoTokenEl.value.trim()); } catch {} }); }
   
 
       async function refreshStatus() {
         try {
-          const res = await fetch('/api/status');
+          const res = await fetch('/api/status', { headers: { ...authHeaders() } });
           const data = await res.json();
           const st = data.status || 'unknown';
           statusEl.textContent = st;
@@ -346,8 +357,9 @@
       }
 
       // WebSocket stream
-      const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-      const ws = new WebSocket(`${wsProto}://${location.host}/ws`);
+  const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const wsToken = encodeURIComponent(getAuthToken() || '');
+  const ws = new WebSocket(`${wsProto}://${location.host}/ws${wsToken ? ('?token=' + wsToken) : ''}`);
       ws.onmessage = (evt) => {
         try {
           const m = JSON.parse(evt.data);
@@ -411,7 +423,7 @@
           source_kind: sourceKindEl.value,
           ground_truth_override: (document.getElementById('gtOverride').value || '') || null,
         };
-        const res = await fetch('/api/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const res = await fetch('/api/start', { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: JSON.stringify(body) });
         if (!res.ok) {
           let msg = '';
           try {
@@ -429,7 +441,7 @@
       // Stop handler: POST /api/stop and refresh status
       document.getElementById('stopBtn').onclick = async () => {
         try {
-          const res = await fetch('/api/stop', { method: 'POST' });
+          const res = await fetch('/api/stop', { method: 'POST', headers: { ...authHeaders() } });
           if (!res.ok) {
             let msg = '';
             try { const data = await res.json(); msg = data.detail || JSON.stringify(data); } catch (e) { msg = await res.text(); }
@@ -447,7 +459,7 @@
         scanIfacesBtn.onclick = async (e) => {
           e.preventDefault();
           try {
-            const res = await fetch('/api/interfaces');
+            const res = await fetch('/api/interfaces', { headers: { ...authHeaders() } });
             const data = await res.json();
             interfacesList.innerHTML = '';
             if (!data.tshark) {
@@ -474,7 +486,7 @@
         listPcapsBtn.onclick = async (e) => {
           e.preventDefault();
           try {
-            const res = await fetch('/api/pcaps');
+            const res = await fetch('/api/pcaps', { headers: { ...authHeaders() } });
             const data = await res.json();
             pcapsList.innerHTML = '';
             if (!data.ok) {
@@ -501,7 +513,7 @@
       document.getElementById('blockBtn').onclick = async () => {
         const txt = document.getElementById('blockSources').value.trim();
         const list = txt ? txt.split(',').map(s => s.trim()).filter(Boolean) : [];
-        const res = await fetch('/api/mitigation', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ block_sources: list }) });
+  const res = await fetch('/api/mitigation', { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: JSON.stringify({ block_sources: list }) });
         const data = await res.json();
         if (Array.isArray(data.mitigation) && data.mitigation.length) {
           blockedList.innerHTML = data.mitigation.map(x => `<span class="badge"><span class="dot ${x.stage}"></span>${x.ip} (${x.stage})</span>`).join(' ');
@@ -514,7 +526,7 @@
       document.getElementById('unblockBtn').onclick = async () => {
         const txt = document.getElementById('unblockSources').value.trim();
         const list = txt ? txt.split(',').map(s => s.trim()).filter(Boolean) : [];
-        const res = await fetch('/api/mitigation', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ unblock_sources: list }) });
+  const res = await fetch('/api/mitigation', { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: JSON.stringify({ unblock_sources: list }) });
         const data = await res.json();
         if (Array.isArray(data.mitigation) && data.mitigation.length) {
           blockedList.innerHTML = data.mitigation.map(x => `<span class="badge"><span class="dot ${x.stage}"></span>${x.ip} (${x.stage})</span>`).join(' ');
@@ -527,7 +539,7 @@
       document.getElementById('allowAddBtn').onclick = async () => {
         const txt = document.getElementById('allowlistInput').value.trim();
         const list = txt ? txt.split(',').map(s => s.trim()).filter(Boolean) : [];
-        const res = await fetch('/api/mitigation', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ allowlist_add: list }) });
+  const res = await fetch('/api/mitigation', { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: JSON.stringify({ allowlist_add: list }) });
         const data = await res.json();
         if (Array.isArray(data.mitigation) && data.mitigation.length) {
           blockedList.textContent = data.mitigation.map(x => `${x.ip} (${x.stage})`).join(', ');
@@ -539,7 +551,7 @@
       document.getElementById('allowRemoveBtn').onclick = async () => {
         const txt = document.getElementById('allowlistInput').value.trim();
         const list = txt ? txt.split(',').map(s => s.trim()).filter(Boolean) : [];
-        const res = await fetch('/api/mitigation', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ allowlist_remove: list }) });
+  const res = await fetch('/api/mitigation', { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: JSON.stringify({ allowlist_remove: list }) });
         const data = await res.json();
         if (Array.isArray(data.mitigation) && data.mitigation.length) {
           blockedList.textContent = data.mitigation.map(x => `${x.ip} (${x.stage})`).join(', ');
@@ -550,7 +562,7 @@
 
       // External ingest helpers and UI
       async function postIngest(payload) {
-        const res = await fetch('/api/ingest', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+  const res = await fetch('/api/ingest', { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: JSON.stringify(payload) });
         if (!res.ok) {
           let msg = '';
           try { const data = await res.json(); msg = data.detail || JSON.stringify(data); } catch (e) { msg = await res.text(); }
@@ -630,7 +642,7 @@
         const hyst = parseInt(document.getElementById('hysteresisInput').value || '2', 10);
         const cool = parseInt(document.getElementById('cooldownInput').value || '120', 10);
         await fetch('/api/mitigation', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() },
           body: JSON.stringify({ hysteresis_windows: hyst, cooldown_seconds: cool })
         });
       };

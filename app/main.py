@@ -9,8 +9,8 @@ import shutil
 import subprocess
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -738,6 +738,9 @@ logger = logging.getLogger("lucid-app")
 manager = ConnectionManager()
 service = DetectorService(manager)
 
+# Demo auth: if DEMO_TOKEN is set, require it for /api/* and /ws
+AUTH_TOKEN = os.environ.get("DEMO_TOKEN")
+
 
 # Serve static dashboard
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
@@ -752,6 +755,31 @@ async def on_startup():
     # Capture the running asyncio loop so background threads can dispatch coroutines
     loop = asyncio.get_running_loop()
     service.set_loop(loop)
+
+
+@app.middleware("http")
+async def demo_auth_middleware(request: Request, call_next):
+    # Allow static and root without auth; protect /api/* when token is configured
+    if AUTH_TOKEN and request.url.path.startswith("/api/"):
+        token = None
+        auth = request.headers.get("authorization") or request.headers.get("Authorization")
+        if auth and auth.lower().startswith("bearer "):
+            token = auth.split(" ", 1)[1].strip()
+        if not token:
+            token = request.headers.get("x-auth-token")
+        if not token:
+            try:
+                token = request.query_params.get("token")
+            except Exception:
+                token = None
+        if not token:
+            try:
+                token = request.cookies.get("auth_token")
+            except Exception:
+                token = None
+        if token != AUTH_TOKEN:
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401, headers={"WWW-Authenticate": "Bearer"})
+    return await call_next(request)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -957,6 +985,17 @@ def ingest(data: IngestPayload):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    # Enforce token via query param when configured
+    if AUTH_TOKEN:
+        try:
+            qp = websocket.query_params or {}
+            token = qp.get("token")
+            if token != AUTH_TOKEN:
+                await websocket.close(code=1008)
+                return
+        except Exception:
+            await websocket.close(code=1008)
+            return
     await manager.connect(websocket)
     try:
         while True:
