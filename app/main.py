@@ -738,8 +738,42 @@ logger = logging.getLogger("lucid-app")
 manager = ConnectionManager()
 service = DetectorService(manager)
 
-# Demo auth: if DEMO_TOKEN is set, require it for /api/* and /ws
-AUTH_TOKEN = os.environ.get("DEMO_TOKEN")
+def _load_demo_token() -> Optional[str]:
+    """Load demo auth token from environment or from a local file for convenience.
+    Search order:
+      1) DEMO_TOKEN environment variable
+      2) Token file specified by DEMO_TOKEN_FILE env var (path)
+      3) Repo-local files: .demo_token, demo_token.txt, config/demo_token.txt
+    Returns the token string or None if not configured.
+    """
+    tok = os.environ.get("DEMO_TOKEN")
+    if tok and tok.strip():
+        logger.info("Demo auth enabled via DEMO_TOKEN environment variable")
+        return tok.strip()
+    # Optional: externalize token in a file (avoids exporting every run)
+    candidate_paths: List[str] = []
+    env_file = os.environ.get("DEMO_TOKEN_FILE")
+    if env_file:
+        candidate_paths.append(os.path.expanduser(env_file))
+    candidate_paths.extend([
+        os.path.join(REPO_ROOT, ".demo_token"),
+        os.path.join(REPO_ROOT, "demo_token.txt"),
+        os.path.join(REPO_ROOT, "config", "demo_token.txt"),
+    ])
+    for p in candidate_paths:
+        try:
+            if os.path.isfile(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    val = f.read().strip()
+                    if val:
+                        logger.info(f"Demo auth enabled via token file: {p}")
+                        return val
+        except Exception as e:
+            logger.warning(f"Failed reading DEMO token from {p}: {e}")
+    return None
+
+# Demo auth: require token for /api/* and /ws if configured
+AUTH_TOKEN = _load_demo_token()
 
 
 # Serve static dashboard

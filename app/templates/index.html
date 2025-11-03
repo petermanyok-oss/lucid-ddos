@@ -4,10 +4,14 @@
     <header>
       <div class="container" style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
         <div>
-          <h1>LUCID DDoS Detector <span class="chip" title="UI build version">UI v2025.11.03</span></h1>
+          <h1>LUCID DDoS Detector <span class="chip" title="UI build version">UI v2025.11.03.1</span></h1>
           <div id="status">Status: <span id="statusText">loading...</span> <span id="statusPill" class="status-pill">-</span></div>
         </div>
-        <div>
+        <div style="display:flex; align-items:center; gap:8px;">
+          <div id="authBox" style="display:none; align-items:center; gap:8px;">
+            <span id="authStatus" class="muted">Logged in</span>
+            <button id="logoutBtn" class="secondary" title="Logout">Logout</button>
+          </div>
           <button id="themeToggle" class="secondary" title="Toggle light/dark" aria-label="Toggle theme" style="font-size:18px; line-height:1;">
             🌙
           </button>
@@ -33,8 +37,8 @@
       input,button { padding:8px 10px; border-radius:8px; border:1px solid #374151; background:#0f172a; color:#e5e7eb; }
       button { background:#2563eb; border:0; }
     </style>
-    <link rel="stylesheet" href="/static/styles.css?v=20251030-2" />
-    <link rel="stylesheet" href="static/styles.css?v=20251030-2" />
+  <link rel="stylesheet" href="/static/styles.css?v=20251103-1" />
+  <link rel="stylesheet" href="static/styles.css?v=20251103-1" />
       <div id="status">Status: <span id="statusText">loading...</span></div>
       <div id="statusError" class="banner hidden" style="margin-top:8px;"></div>
       <div id="kpis" style="margin-top:8px; font-size: 0.95em; color: #374151;">
@@ -93,7 +97,7 @@
         <label>Alert threshold (0-1):</label>
         <input type="number" step="0.01" id="threshold" value="0.5" />
       </div>
-      <div class="form-row">
+      <div class="form-row" id="demoTokenRow">
         <label>Demo token (optional):</label>
         <input id="demoToken" placeholder="Paste token for protected demo" />
       </div>
@@ -187,7 +191,7 @@
     </section>
 
     <script>
-      console.log('LUCID UI version: 2025-10-30');
+  console.log('LUCID UI version: 2025-11-03.1');
         // Remove critical CSS after main stylesheet loads
         window.addEventListener('load', () => {
           const sheets = Array.from(document.styleSheets);
@@ -222,9 +226,45 @@
   // Auth helpers
   const tokenKey = 'lucid-demo-token';
   try { const savedTok = localStorage.getItem(tokenKey); if (savedTok && demoTokenEl) demoTokenEl.value = savedTok; } catch {}
+  let isCookieAuth = false;
   function getAuthToken() { return (demoTokenEl && demoTokenEl.value.trim()) || ''; }
-  function authHeaders() { const t = getAuthToken(); return t ? { 'Authorization': 'Bearer ' + t } : {}; }
+  function authHeaders() {
+    // If cookie-based auth is active, no need to add Authorization header
+    if (isCookieAuth) return {};
+    const t = getAuthToken();
+    return t ? { 'Authorization': 'Bearer ' + t } : {};
+  }
   if (demoTokenEl) { demoTokenEl.addEventListener('change', () => { try { localStorage.setItem(tokenKey, demoTokenEl.value.trim()); } catch {} }); }
+  async function detectAuthState() {
+    const demoRow = document.getElementById('demoTokenRow');
+    const authBox = document.getElementById('authBox');
+    try {
+      const res = await fetch('/api/status', { method: 'GET' });
+      if (res.ok) {
+        isCookieAuth = true;
+        if (demoRow) demoRow.style.display = 'none';
+        if (authBox) authBox.style.display = 'flex';
+      } else {
+        isCookieAuth = false;
+        if (demoRow) demoRow.style.display = '';
+        if (authBox) authBox.style.display = 'none';
+      }
+    } catch (e) {
+      isCookieAuth = false;
+      if (demoRow) demoRow.style.display = '';
+      if (authBox) authBox.style.display = 'none';
+    }
+  }
+  detectAuthState();
+  const logoutBtn = document.getElementById('logoutBtn');
+  if (logoutBtn) {
+    logoutBtn.onclick = async () => {
+      try {
+        await fetch('/auth/logout', { method: 'POST' });
+      } catch {}
+      window.location.href = '/login';
+    };
+  }
   
 
       async function refreshStatus() {
