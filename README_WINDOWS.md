@@ -51,12 +51,13 @@ cd lucid-ddos
 
 Or download the ZIP from GitHub and extract.
 
-## 3) Create a virtual environment and install deps
+## 3) Create a virtual environment (python39) and install deps
 
 ```powershell
-# Create and activate venv
-py -3 -m venv .venv
-.\.venv\Scripts\activate
+# Create and activate a venv named "python39"
+# Prefer Python 3.9 for widest TensorFlow 2.x compatibility on Windows
+py -3.9 -m venv python39
+.\python39\Scripts\activate
 
 # Upgrade pip
 python -m pip install -U pip
@@ -66,6 +67,7 @@ pip install fastapi uvicorn[standard] pyshark numpy tensorflow==2.* pydantic
 ```
 
 Notes:
+
 - TensorFlow CPU is sufficient. GPU requires CUDA/cuDNN with matching versions (optional).
 - If TensorFlow install is heavy, you can start with `pip install tensorflow-cpu==2.*`.
 
@@ -76,17 +78,19 @@ Notes:
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-- Open http://127.0.0.1:8000 in your browser.
+- Open <http://127.0.0.1:8000> in your browser.
 - Allow Python through Windows Defender Firewall when prompted.
 
 ## 5) Using the dashboard
 
 ### 5.1 Source types
+
 - Network interface: Live capture using tshark/Npcap.
 - PCAP file: Replay packets from a .pcap.
 - External HTTP ingest: Push pre-parsed feature fragments to an HTTP endpoint.
 
 ### 5.2 Live capture (Network interface)
+
 1) Click "Scan" next to Source to list interfaces (requires tshark).
 2) Pick a normal interface (e.g., `Ethernet`, `Wi-Fi`, or an `NPF_{GUID}` entry).
 3) Set Model path to your `.h5` model (the app expects names like `10t-10n-*.h5` so it can auto-detect window/flow length).
@@ -94,10 +98,12 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 5) Click Start.
 
 Troubleshooting:
+
 - If Start fails, try running the terminal as Administrator OR reinstall Npcap with "Restrict Npcap to Admin only" UNCHECKED.
 - Ensure `tshark -D` lists your interfaces.
 
 ### 5.3 PCAP playback
+
 1) Set Source type to "PCAP file".
 2) Set Source to a Windows path, e.g., `sample-dataset\CIC-DDoS-2019-SynFlood.pcap`.
 3) Set Model path to your `.h5` file.
@@ -105,6 +111,7 @@ Troubleshooting:
 5) Click Start.
 
 ### 5.4 External HTTP ingest (no packet capture)
+
 This mode doesn’t sniff; you push JSON feature fragments to the app.
 
 1) Set Source type to "External HTTP ingest" and click Start.
@@ -157,11 +164,13 @@ If you include `labels` (0/1 per fragment), the app computes KPIs (TPR/FPR/TTD) 
 ## 8) Development tips
 
 - Virtual environment activation each session:
+
 ```powershell
-.\.venv\Scripts\activate
+.\python39\Scripts\activate
 ```
 
 - Start server quickly:
+
 ```powershell
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```

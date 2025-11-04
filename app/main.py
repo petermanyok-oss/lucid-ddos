@@ -7,7 +7,7 @@ import asyncio
 import queue
 import shutil
 import subprocess
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse, Response
@@ -39,6 +39,9 @@ class StartConfig(BaseModel):
     # Optional: force ground-truth labeling to help compute KPIs when labels are unavailable
     # one of: 'all_attack', 'all_benign'
     ground_truth_override: Optional[str] = None
+    # PCAP playback options (optional)
+    pcap_realtime: Optional[bool] = None  # if true, throttle PCAP windows to real time (sleep time_window between windows)
+    pcap_loop: Optional[bool] = None      # if true, loop the PCAP file when it reaches EOF
 
 
 class IngestPayload(BaseModel):
@@ -105,6 +108,10 @@ class DetectorService:
         # external ingest buffer and source kind
         self._ingest: Optional["queue.Queue"] = None
         self._source_kind: str = "pcap"
+    # PCAP playback options
+    self._pcap_path: Optional[str] = None
+    self._pcap_realtime: bool = False
+    self._pcap_loop: bool = False
         # auto-mitigation settings
         self._auto_block_limit = 20  # cap number of sources auto-blocked per window
         self.hysteresis_windows = 2  # require N consecutive alert windows before acting
@@ -359,6 +366,15 @@ class DetectorService:
                     raise ValueError(f"Failed to open PCAP with pyshark: {resolved_source} :: {e}")
                 self.cap = None
                 data_source = os.path.basename(resolved_source)
+                # PCAP playback settings from cfg or environment
+                def _env_bool(name: str) -> Optional[bool]:
+                    v = os.environ.get(name)
+                    if v is None:
+                        return None
+                    return str(v).strip().lower() in ("1","true","yes","on")
+                self._pcap_path = resolved_source
+                self._pcap_realtime = bool(cfg.pcap_realtime) if (cfg.pcap_realtime is not None) else bool(_env_bool("LUCID_PCAP_REALTIME"))
+                self._pcap_loop = bool(cfg.pcap_loop) if (cfg.pcap_loop is not None) else bool(_env_bool("LUCID_PCAP_LOOP"))
             else:
                 # Preflight checks for live capture
                 if not self._tshark_path():
@@ -478,10 +494,27 @@ class DetectorService:
                     cap = self.cap if self.cap is not None else self.cap_file
                     samples = process_live_traffic(cap, None, self.labels, self.max_flow_len, traffic_type="all", time_window=self.time_window)
                     if len(samples) == 0:
-                        # For file capture, when finished, stop
+                        # For file capture, when finished, either loop or stop
                         if isinstance(cap, pyshark.FileCapture):
-                            self._status = "completed"
-                            break
+                            if self._pcap_loop and self._pcap_path:
+                                try:
+                                    # Close and reopen to loop from beginning
+                                    try:
+                                        if self.cap_file:
+                                            self.cap_file.close()
+                                    except Exception:
+                                        pass
+                                    self.cap_file = pyshark.FileCapture(self._pcap_path)
+                                    # reset indices/history if desired; keep history for charts
+                                    self._window_index = 0
+                                    logger.info(f"Looping PCAP from beginning: {self._pcap_path}")
+                                except Exception as e:
+                                    self._status = "error"
+                                    self._last_error = f"Failed to loop PCAP: {e}"
+                                    break
+                            else:
+                                self._status = "completed"
+                                break
                         # For live capture, just continue to next window
                         continue
 
@@ -685,6 +718,15 @@ class DetectorService:
                 # advance window index after completing this window
                 self._window_index += 1
 
+                # Optional: throttle PCAP playback to real-time windowing
+                if self._source_kind == "pcap" and self._pcap_realtime and not self._stop_event.is_set():
+                    # Sleep in short steps to be responsive to stop
+                    remaining = float(self.time_window)
+                    while remaining > 0 and not self._stop_event.is_set():
+                        step = 0.25 if remaining > 0.25 else remaining
+                        time.sleep(step)
+                        remaining -= step
+
             except Exception as e:
                 try:
                     logger.exception("Error in detector loop")
@@ -738,7 +780,7 @@ logger = logging.getLogger("lucid-app")
 manager = ConnectionManager()
 service = DetectorService(manager)
 
-def _load_demo_token() -> Optional[str]:
+def _load_demo_token() -> Tuple[Optional[str], str]:
     """Load demo auth token from environment or from a local file for convenience.
     Search order:
       1) DEMO_TOKEN environment variable
@@ -749,7 +791,7 @@ def _load_demo_token() -> Optional[str]:
     tok = os.environ.get("DEMO_TOKEN")
     if tok and tok.strip():
         logger.info("Demo auth enabled via DEMO_TOKEN environment variable")
-        return tok.strip()
+        return tok.strip(), "env:DEMO_TOKEN"
     # Optional: externalize token in a file (avoids exporting every run)
     candidate_paths: List[str] = []
     env_file = os.environ.get("DEMO_TOKEN_FILE")
@@ -767,13 +809,13 @@ def _load_demo_token() -> Optional[str]:
                     val = f.read().strip()
                     if val:
                         logger.info(f"Demo auth enabled via token file: {p}")
-                        return val
+                        return val, f"file:{p}"
         except Exception as e:
             logger.warning(f"Failed reading DEMO token from {p}: {e}")
-    return None
+    return None, "none"
 
 # Demo auth: require token for /api/* and /ws if configured
-AUTH_TOKEN = _load_demo_token()
+AUTH_TOKEN, AUTH_SOURCE = _load_demo_token()
 
 
 # Serve static dashboard
@@ -879,6 +921,48 @@ async def auth_logout():
 @app.get("/api/status")
 def get_status():
     return service.status()
+
+
+@app.get("/api/auth/status")
+def auth_status(request: Request):
+    """Report whether demo auth is enabled and whether this request is authenticated.
+    Useful for deployment verification and troubleshooting.
+    """
+    enabled = bool(AUTH_TOKEN)
+    authed = False
+    via = "none"
+    if enabled:
+        # Check cookie first (how the UI authenticates after login)
+        try:
+            cookie_tok = request.cookies.get("auth_token")
+        except Exception:
+            cookie_tok = None
+        if cookie_tok and cookie_tok == AUTH_TOKEN:
+            authed = True
+            via = "cookie"
+        else:
+            # Also accept Authorization header for tooling
+            auth = request.headers.get("authorization") or request.headers.get("Authorization")
+            if auth and auth.lower().startswith("bearer "):
+                token = auth.split(" ", 1)[1].strip()
+                if token == AUTH_TOKEN:
+                    authed = True
+                    via = "header"
+            if not authed:
+                # Fallback: query param token
+                try:
+                    qp_tok = request.query_params.get("token")
+                except Exception:
+                    qp_tok = None
+                if qp_tok and qp_tok == AUTH_TOKEN:
+                    authed = True
+                    via = "query"
+    return {
+        "enabled": enabled,
+        "authenticated": authed,
+        "auth_via": via,
+        "source": globals().get("AUTH_SOURCE", "unknown"),
+    }
 
 
 @app.get("/api/history")
