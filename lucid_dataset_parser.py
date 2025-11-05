@@ -16,6 +16,7 @@
 
 import sys
 import os
+from datetime import datetime, timezone
 import time
 import pyshark
 import socket
@@ -108,12 +109,52 @@ def parse_labels(dataset_type=None, attackers=None,victims=None, label=1):
 
     return output_dict
 
+# Robustly extract packet timestamp as epoch seconds across pyshark variants/OSes
+def packet_epoch_seconds(pkt) -> float:
+    # 1) Prefer explicit epoch fields
+    for val in (
+        getattr(getattr(pkt, "frame_info", None), "time_epoch", None),
+        getattr(pkt, "sniff_timestamp", None),
+    ):
+        if val is not None:
+            try:
+                return float(str(val))
+            except Exception:
+                pass
+    # 2) datetime object
+    st = getattr(pkt, "sniff_time", None)
+    if st is not None:
+        try:
+            return float(st.timestamp())
+        except Exception:
+            pass
+    # 3) ISO-8601 strings possibly ending with 'Z' and 9-digit fractional seconds
+    for iso in (
+        getattr(pkt, "sniff_timestamp", None),
+        getattr(getattr(pkt, "frame_info", None), "time", None),
+    ):
+        if isinstance(iso, str) and iso:
+            s = iso.strip().replace("Z", "+00:00")
+            if "." in s:
+                head, tail = s.split(".", 1)
+                digits = "".join(ch for ch in tail if ch.isdigit())
+                zone = tail[len(digits):]
+                # normalize to microseconds (6 digits)
+                frac = (digits + "000000")[:6]
+                s = f"{head}.{frac}{zone}"
+            try:
+                return datetime.fromisoformat(s).timestamp()
+            except Exception:
+                continue
+    # As a last resort, use monotonic now (shouldn't happen)
+    return float(time.time())
+
 def parse_packet(pkt):
     pf = packet_features()
     tmp_id = [0,0,0,0,0]
 
     try:
-        pf.features_list.append(float(pkt.sniff_timestamp))  # timestampchild.find('Tag').text
+        pf.features_list.append(packet_epoch_seconds(pkt))  # timestamp in epoch seconds
         pf.features_list.append(int(pkt.ip.len))  # packet length
         pf.features_list.append(int(hashlib.sha256(str(pkt.highest_layer).encode('utf-8')).hexdigest(),
                                     16) % 10 ** 8)  # highest layer in the packet
@@ -175,8 +216,9 @@ def process_pcap(pcap_file,dataset_type,in_labels,max_flow_len,labelled_flows,ma
             print(pcap_name + " packet #", i)
 
         # start_time_window is used to group packets/flows captured in a time-window
-        if start_time_window == -1 or float(pkt.sniff_timestamp) > start_time_window + time_window:
-            start_time_window = float(pkt.sniff_timestamp)
+        ts = packet_epoch_seconds(pkt)
+        if start_time_window == -1 or ts > start_time_window + time_window:
+            start_time_window = ts
 
         pf = parse_packet(pkt)
         store_packet(pf, temp_dict, start_time_window, max_flow_len)
@@ -217,7 +259,7 @@ def process_live_traffic(cap, dataset_type, in_labels, max_flow_len, traffic_typ
                 # EOF or read error -> stop this window
                 break
             try:
-                ts = float(pkt.sniff_timestamp)
+                ts = packet_epoch_seconds(pkt)
             except Exception:
                 ts = None
             if window_start is None:
