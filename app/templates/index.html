@@ -83,6 +83,9 @@
                 <div class="form-row">
                     <label>Source (iface or .pcap):</label>
                     <input id="source" placeholder="eth0 or /path/to/file.pcap" list="interfacesList" style="flex: 1;" />
+                    <select id="pcapSelect" style="display: none; flex: 1;">
+                        <option value="">-- choose a PCAP --</option>
+                    </select>
                     <button id="scanIfacesBtn" class="secondary" title="Scan interfaces">Scan</button>
                     <button id="listPcapsBtn" class="secondary" title="List available PCAPs" style="display: none;">List PCAPs</button>
                     <datalist id="interfacesList"></datalist>
@@ -153,8 +156,11 @@
         </section>
 
         <section class="charts card">
-            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px;">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; gap: 12px;">
                 <h2 style="margin: 0; font-size: 1.25em;">Metrics</h2>
+                <div id="debugStats" class="muted" style="font-size: 0.9em;">
+                    
+                </div>
                 <span class="chip" title="Alert threshold for DDoS Fraction">threshold: <span id="thresholdBadge">0.50</span></span>
             </div>
             <details class="help" style="margin-bottom: 16px; font-size: 0.9em;">
@@ -255,6 +261,7 @@
         const listPcapsBtn = document.getElementById('listPcapsBtn');
         const interfacesList = document.getElementById('interfacesList');
         const pcapsList = document.getElementById('pcapsList');
+    const pcapSelect = document.getElementById('pcapSelect');
         const ingestHint = document.getElementById('ingestHint');
         const ingestTest = document.getElementById('ingestTest');
         const ingestJson = document.getElementById('ingestJson');
@@ -434,55 +441,81 @@
             chart.update();
         }
 
+        // Shared WS message handler (used for initial stream and reconnects)
+        function handleWsMessage(m) {
+            const next = m?.forecast?.ddos_fraction_next ?? null;
+            const confHi = m?.forecast?.confidence_high ?? null;
+            const confLo = m?.forecast?.confidence_low ?? null;
+            const alertVal = (m?.alert ? m.ddos_fraction : NaN);
+            pushChartPoint(ddosChart, m.ts, [m.ddos_fraction, confHi, confLo, next, alertVal]);
+            pushChartPoint(flowChart, m.ts, m?.metrics?.flow_density ?? 0);
+            pushChartPoint(portsChart, m.ts, m?.metrics?.unique_dest_ports ?? 0);
+            pushChartPoint(srcChart, m.ts, m?.metrics?.src_ip_diversity ?? 0);
+
+            // Debug strip: show latest fractions and counts
+            try {
+                const ds = document.getElementById('debugStats');
+                if (ds) {
+                    const samples = (typeof m?.samples === 'number') ? m.samples : null;
+                    const pos = (typeof m?.positive_count === 'number') ? m.positive_count : null;
+                    const frac = (typeof m?.ddos_fraction === 'number') ? m.ddos_fraction.toFixed(3) : '-';
+                    ds.textContent = `last: ddos_fraction=${frac}${samples!=null?` (pos ${pos}/${samples})`:''}`;
+                }
+            } catch {}
+
+            if (m.alert || (m?.forecast?.predicted_alert)) {
+                alertBanner.classList.remove('hidden');
+                const item = document.createElement('li');
+                const pred = (m?.forecast?.predicted_alert && !m.alert) ? ' (predicted next window)' : '';
+                let autoTxt = '';
+                if (Array.isArray(m.auto_blocked) && m.auto_blocked.length) {
+                    const ab = m.auto_blocked.map(x => typeof x === 'string' ? x : `${x.ip} (${x.stage||'blocked'})`).join(', ');
+                    autoTxt = ` | auto-blocked: ${ab}`;
+                }
+                item.textContent = `${timeFmt(m.ts)} ALERT${pred} — ddos_fraction=${fmtPct(m.ddos_fraction)} (threshold ${fmtPct(m.threshold)})${autoTxt}`;
+                item.style.marginBottom = '8px';
+                alertList.prepend(item);
+            } else {
+                alertBanner.classList.add('hidden');
+            }
+
+            // Update currently blocked list immediately if present in payload
+            if (Array.isArray(m.mitigation) && m.mitigation.length) {
+                blockedList.innerHTML = m.mitigation.map(x => `<span class="badge"><span class="dot ${x.stage}"></span>${x.ip} (${x.stage})</span>`).join(' ');
+            } else if (Array.isArray(m.blocked_sources)) {
+                blockedList.innerHTML = m.blocked_sources.length ? m.blocked_sources.map(ip => `<span class="badge"><span class="dot monitor"></span>${ip}</span>`).join(' ') : '(none)';
+            }
+
+            // Update threshold badge and line on chart
+            if (typeof m.threshold === 'number') {
+                const thr = m.threshold;
+                document.getElementById('thresholdBadge').textContent = thr.toFixed(2);
+                ddosChart.options.plugins.thresholdLine.value = thr;
+            }
+        }
+
         // WebSocket stream
         const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
         const wsToken = encodeURIComponent(getAuthToken() || '');
-        const ws = new WebSocket(`${wsProto}://${location.host}/ws${wsToken ? ('?token=' + wsToken) : ''}`);
-        ws.onmessage = (evt) => {
+        let ws = new WebSocket(`${wsProto}://${location.host}/ws${wsToken ? ('?token=' + wsToken) : ''}`);
+        ws.onmessage = (evt) => { try { const m = JSON.parse(evt.data); handleWsMessage(m); } catch (e) { console.error('Bad WS message', e); } };
+
+        // History backfill (only if charts are empty)
+        async function fetchHistoryAndPopulate() {
             try {
-                const m = JSON.parse(evt.data);
-                const next = m.forecast?.ddos_fraction_next ?? null;
-                const confHi = m.forecast?.confidence_high ?? null;
-                const confLo = m.forecast?.confidence_low ?? null;
-                const alertVal = (m.alert ? m.ddos_fraction : NaN);
-                pushChartPoint(ddosChart, m.ts, [m.ddos_fraction, confHi, confLo, next, alertVal]);
-                pushChartPoint(flowChart, m.ts, m.metrics.flow_density);
-                pushChartPoint(portsChart, m.ts, m.metrics.unique_dest_ports);
-                pushChartPoint(srcChart, m.ts, m.metrics.src_ip_diversity);
-
-                if (m.alert || m.forecast?.predicted_alert) {
-                    alertBanner.classList.remove('hidden');
-                    const item = document.createElement('li');
-                    const pred = m.forecast?.predicted_alert && !m.alert ? ' (predicted next window)' : '';
-                    let autoTxt = '';
-                    if (Array.isArray(m.auto_blocked) && m.auto_blocked.length) {
-                        const ab = m.auto_blocked.map(x => typeof x === 'string' ? x : `${x.ip} (${x.stage||'blocked'})`).join(', ');
-                        autoTxt = ` | auto-blocked: ${ab}`;
-                    }
-                    item.textContent = `${timeFmt(m.ts)} ALERT${pred} — ddos_fraction=${fmtPct(m.ddos_fraction)} (threshold ${fmtPct(m.threshold)})${autoTxt}`;
-                    item.style.marginBottom = '8px';
-                    alertList.prepend(item);
-                } else {
-                    alertBanner.classList.add('hidden');
-                }
-
-                // Update currently blocked list immediately if present in payload
-                if (Array.isArray(m.mitigation) && m.mitigation.length) {
-                    blockedList.innerHTML = m.mitigation.map(x => `<span class="badge"><span class="dot ${x.stage}"></span>${x.ip} (${x.stage})</span>`).join(' ');
-                } else if (Array.isArray(m.blocked_sources)) {
-                    blockedList.innerHTML = m.blocked_sources.length ? m.blocked_sources.map(ip => `<span class="badge"><span class="dot monitor"></span>${ip}</span>`).join(' ') : '(none)';
-                }
-
-                // Update threshold badge and line on chart
-                if (typeof m.threshold === 'number') {
-                    const thr = m.threshold;
-                    document.getElementById('thresholdBadge').textContent = thr.toFixed(2);
-                    ddosChart.options.plugins.thresholdLine.value = thr;
-                }
+                if ((ddosChart.data.labels || []).length > 0) return; // avoid duplicate points
+                const res = await fetch('/api/history', { headers: { ...authHeaders() } });
+                if (!res.ok) return;
+                const hist = await res.json();
+                if (!Array.isArray(hist) || hist.length === 0) return;
+                const recent = hist.slice(-50);
+                recent.forEach(m => {
+                    try { handleWsMessage(m); } catch {}
+                });
             } catch (e) {
-                console.error('Bad WS message', e);
+                // noop
             }
-        };
+        }
 
         // Controls
         document.getElementById('startBtn').onclick = async () => {
@@ -586,6 +619,9 @@
                     const res = await fetch('/api/pcaps', { headers: { ...authHeaders() } });
                     const data = await res.json();
                     pcapsList.innerHTML = '';
+                    if (pcapSelect) {
+                        pcapSelect.innerHTML = '<option value="">-- choose a PCAP --</option>';
+                    }
                     if (!data.ok) {
                         alert('Failed to list PCAPs: ' + (data.error || 'unknown error'));
                         return;
@@ -595,6 +631,12 @@
                         opt.value = it.path;
                         opt.label = it.name || it.path;
                         pcapsList.appendChild(opt);
+                        if (pcapSelect) {
+                            const o = document.createElement('option');
+                            o.value = it.path;
+                            o.textContent = it.name || it.path;
+                            pcapSelect.appendChild(o);
+                        }
                     });
                     if (!data.files || data.files.length === 0) {
                         alert('No .pcap files found in sample-dataset/ or repo.');
@@ -603,6 +645,14 @@
                     alert('Failed to list PCAPs: ' + (e?.message || e));
                 }
             };
+        }
+
+        // When choosing from dropdown, mirror selection into the source input
+        if (pcapSelect) {
+            pcapSelect.addEventListener('change', () => {
+                const v = pcapSelect.value || '';
+                sourceEl.value = v;
+            });
         }
 
         document.getElementById('blockBtn').onclick = async () => {
@@ -708,6 +758,7 @@
                 if (ingestTest) ingestTest.style.display = 'none';
                 if (scanIfacesBtn) scanIfacesBtn.style.display = '';
                 if (listPcapsBtn) listPcapsBtn.style.display = 'none';
+                if (pcapSelect) pcapSelect.style.display = 'none';
                 const pcapOpts = document.getElementById('pcapOptions'); if (pcapOpts) pcapOpts.style.display = 'none';
             } else if (kind === 'pcap') {
                 sourceEl.placeholder = '/path/to/file.pcap';
@@ -716,6 +767,7 @@
                 if (ingestTest) ingestTest.style.display = 'none';
                 if (scanIfacesBtn) scanIfacesBtn.style.display = 'none';
                 if (listPcapsBtn) listPcapsBtn.style.display = '';
+                if (pcapSelect) pcapSelect.style.display = '';
                 const pcapOpts = document.getElementById('pcapOptions'); if (pcapOpts) pcapOpts.style.display = '';
                 // Auto-fetch PCAP list on switch to pcap view for convenience
                 if (pcapsList && (!pcapsList.options || pcapsList.options.length === 0)) {
@@ -730,6 +782,7 @@
                 if (ingestTest) ingestTest.style.display = '';
                 if (scanIfacesBtn) scanIfacesBtn.style.display = 'none';
                 if (listPcapsBtn) listPcapsBtn.style.display = 'none';
+                if (pcapSelect) pcapSelect.style.display = 'none';
                 const pcapOpts = document.getElementById('pcapOptions'); if (pcapOpts) pcapOpts.style.display = 'none';
             }
         }
@@ -763,7 +816,8 @@
             setThemeIcon();
         };
         const saved = (() => { try { return localStorage.getItem(themeKey); } catch { return null; } })();
-        applyTheme(saved || 'theme-light');
+        // Apply saved theme safely; if charts not yet ready, catch to avoid halting script in some browsers
+        try { applyTheme(saved || 'theme-light'); } catch (e) { document.body.classList.add(saved || 'theme-light'); }
         document.getElementById('themeToggle').onclick = () => {
             const next = document.body.classList.contains('theme-light') ? 'theme-dark' : 'theme-light';
             applyTheme(next);

@@ -360,11 +360,10 @@ class DetectorService:
             resolved_source = self._resolve_source_path(cfg.source)
             logger.info(f"Starting capture: source={resolved_source} (tw={self.time_window}s, n={self.max_flow_len})")
             if resolved_source.endswith('.pcap'):
-                try:
-                    self.cap_file = pyshark.FileCapture(resolved_source)
-                except Exception as e:
-                    raise ValueError(f"Failed to open PCAP with pyshark: {resolved_source} :: {e}")
+                # Defer opening FileCapture to the worker thread to avoid AnyIO "no current event loop" errors
+                # in the request handling thread. We'll initialize the capture inside _loop with its own asyncio loop.
                 self.cap = None
+                self.cap_file = None
                 data_source = os.path.basename(resolved_source)
                 # PCAP playback settings from cfg or environment
                 def _env_bool(name: str) -> Optional[bool]:
@@ -375,6 +374,7 @@ class DetectorService:
                 self._pcap_path = resolved_source
                 self._pcap_realtime = bool(cfg.pcap_realtime) if (cfg.pcap_realtime is not None) else bool(_env_bool("LUCID_PCAP_REALTIME"))
                 self._pcap_loop = bool(cfg.pcap_loop) if (cfg.pcap_loop is not None) else bool(_env_bool("LUCID_PCAP_LOOP"))
+                logger.info("PCAP will be opened in detector thread with a dedicated event loop")
             else:
                 # Preflight checks for live capture
                 if not self._tshark_path():
@@ -425,6 +425,13 @@ class DetectorService:
 
     def _loop(self, data_source: str):
         mins, maxs = static_min_max(self.time_window)
+        # Create a dedicated asyncio event loop for this worker thread (required by pyshark in threads)
+        worker_loop: Optional[asyncio.AbstractEventLoop] = None
+        try:
+            worker_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(worker_loop)
+        except Exception:
+            worker_loop = None
         while not self._stop_event.is_set():
             try:
                 # Ingest traffic for this window
@@ -491,6 +498,15 @@ class DetectorService:
                     Y_true = labels_list
                     external_packets = packet_volume
                 else:
+                    # Lazy-open PCAP capture in the worker thread with its own event loop
+                    if self._source_kind == "pcap" and self.cap_file is None and self._pcap_path:
+                        try:
+                            self.cap_file = pyshark.FileCapture(self._pcap_path, use_json=True, keep_packets=False)
+                            logger.info(f"Opened PCAP in worker thread: {self._pcap_path}")
+                        except Exception as e:
+                            self._status = "error"
+                            self._last_error = f"Failed to open PCAP with pyshark: {self._pcap_path} :: {e}"
+                            break
                     cap = self.cap if self.cap is not None else self.cap_file
                     samples = process_live_traffic(cap, None, self.labels, self.max_flow_len, traffic_type="all", time_window=self.time_window)
                     if len(samples) == 0:
@@ -504,7 +520,8 @@ class DetectorService:
                                             self.cap_file.close()
                                     except Exception:
                                         pass
-                                    self.cap_file = pyshark.FileCapture(self._pcap_path)
+                                    # Reopen in worker thread
+                                    self.cap_file = pyshark.FileCapture(self._pcap_path, use_json=True, keep_packets=False)
                                     # reset indices/history if desired; keep history for charts
                                     self._window_index = 0
                                     logger.info(f"Looping PCAP from beginning: {self._pcap_path}")
@@ -549,7 +566,8 @@ class DetectorService:
                 else:
                     [packets] = count_packets_in_dataset([X])
 
-                ddos_fraction = float(np.sum(y_pred) / y_pred.shape[0]) if y_pred.shape[0] > 0 else 0.0
+                pos_count = int(np.sum(y_pred)) if y_pred.shape[0] > 0 else 0
+                ddos_fraction = float(pos_count / y_pred.shape[0]) if y_pred.shape[0] > 0 else 0.0
                 alert = ddos_fraction >= self.threshold
 
                 # Ground-truth window label if available (any flow labeled ddos), or overridden
@@ -673,6 +691,7 @@ class DetectorService:
                     "source": data_source,
                     "packets": int(packets),
                     "samples": int(y_pred.shape[0]),
+                    "positive_count": pos_count,
                     "ddos_fraction": ddos_fraction,
                     "latency_sec": latency,
                     "metrics": metrics,

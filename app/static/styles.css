@@ -97,8 +97,8 @@ button:disabled { opacity: 0.6; cursor: not-allowed; }
 
 /* Help and info styling */
 .help {
-  background: #f9fafb;
-  border: 1px solid #e5e7eb;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
   border-radius: 6px;
   padding: 8px 12px;
   margin: 8px 0 12px;
@@ -106,7 +106,7 @@ button:disabled { opacity: 0.6; cursor: not-allowed; }
 .help summary {
   cursor: pointer;
   font-weight: 600;
-  color: #111827;
+  color: var(--text);
 }
 .help ul { margin: 8px 0 0 16px; }
 
