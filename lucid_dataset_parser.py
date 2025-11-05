@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import sys
+import os
 import time
 import pyshark
 import socket
@@ -186,30 +187,52 @@ def process_pcap(pcap_file,dataset_type,in_labels,max_flow_len,labelled_flows,ma
     print('Completed file {} in {} seconds.'.format(pcap_name, time.time() - start_time))
 
 # Transforms live traffic into input samples for inference
-def process_live_traffic(cap, dataset_type, in_labels, max_flow_len, traffic_type='all',time_window=TIME_WINDOW):
-    start_time = time.time()
+def process_live_traffic(cap, dataset_type, in_labels, max_flow_len, traffic_type='all', time_window=TIME_WINDOW):
+    """Extract one window of traffic from a live interface or a PCAP.
+    - LiveCapture: window uses wall-clock duration (time_window seconds).
+    - FileCapture: window uses PCAP packet timestamps so we advance through the file
+      window-by-window instead of consuming the whole file in the first wall-clock window.
+    Returns a list of labelled flows for the window.
+    """
     temp_dict = OrderedDict()
     labelled_flows = []
 
-    start_time_window = start_time
-    time_window = start_time_window + time_window
+    window_len = float(time_window)
 
     if isinstance(cap, pyshark.LiveCapture) == True:
+        start_time_window = time.time()
+        deadline = start_time_window + window_len
         for pkt in cap.sniff_continuously():
-            if time.time() >= time_window:
+            if time.time() >= deadline:
                 break
             pf = parse_packet(pkt)
             temp_dict = store_packet(pf, temp_dict, start_time_window, max_flow_len)
     elif isinstance(cap, pyshark.FileCapture) == True:
-        while time.time() < time_window:
+        window_start = None
+        window_end = None
+        while True:
             try:
                 pkt = cap.next()
-                pf = parse_packet(pkt)
-                temp_dict = store_packet(pf,temp_dict,start_time_window,max_flow_len)
-            except:
+            except Exception:
+                # EOF or read error -> stop this window
                 break
+            try:
+                ts = float(pkt.sniff_timestamp)
+            except Exception:
+                ts = None
+            if window_start is None:
+                # First packet defines the start of this window in PCAP time
+                window_start = ts if ts is not None else 0.0
+                window_end = window_start + window_len
+            # Stop if this packet falls beyond the current window; it will be consumed
+            # and not included in this window. Losing one boundary packet is acceptable
+            # for streaming playback.
+            if ts is not None and window_end is not None and ts >= window_end:
+                break
+            pf = parse_packet(pkt)
+            temp_dict = store_packet(pf, temp_dict, window_start, max_flow_len)
 
-    apply_labels(temp_dict,labelled_flows, in_labels,traffic_type)
+    apply_labels(temp_dict, labelled_flows, in_labels, traffic_type)
     return labelled_flows
 
 def store_packet(pf,temp_dict,start_time_window, max_flow_len):
