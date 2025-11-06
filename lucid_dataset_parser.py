@@ -253,12 +253,25 @@ def process_live_traffic(cap, dataset_type, in_labels, max_flow_len, traffic_typ
         window_start = None
         window_end = None
         _eof = False
-        while True:
+
+        # Helper to read next packet, honoring a one-packet carry-over buffer
+        def next_pkt():
+            buf = getattr(cap, "_lucid_buf", None)
+            if buf is not None:
+                try:
+                    setattr(cap, "_lucid_buf", None)
+                except Exception:
+                    pass
+                return buf, False
             try:
-                pkt = cap.next()
+                return cap.next(), False
             except Exception:
-                # EOF or read error -> stop this window and mark EOF for caller
-                _eof = True
+                return None, True
+
+        while True:
+            pkt, eof = next_pkt()
+            if pkt is None:
+                _eof = eof
                 break
             try:
                 ts = packet_epoch_seconds(pkt)
@@ -272,6 +285,11 @@ def process_live_traffic(cap, dataset_type, in_labels, max_flow_len, traffic_typ
             # and not included in this window. Losing one boundary packet is acceptable
             # for streaming playback.
             if ts is not None and window_end is not None and ts >= window_end:
+                # Carry this boundary packet into next window
+                try:
+                    setattr(cap, "_lucid_buf", pkt)
+                except Exception:
+                    pass
                 break
             pf = parse_packet(pkt)
             temp_dict = store_packet(pf, temp_dict, window_start, max_flow_len)
